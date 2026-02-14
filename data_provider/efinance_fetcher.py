@@ -321,6 +321,84 @@ class EfinanceFetcher(BaseFetcher):
                 raise RateLimitError(f"efinance 可能被限流: {e}") from e
             
             raise DataFetchError(f"efinance 获取数据失败: {e}") from e
+
+    def get_daily_data_batch(
+        self, 
+        stock_codes: List[str], 
+        start_date: Optional[str] = None, 
+        end_date: Optional[str] = None,
+        days: int = 30
+    ) -> Dict[str, pd.DataFrame]:
+        """批量获取日线数据（efinance 支持批量）"""
+        
+        # 排除美股、港股 and ETF（目前只支持 A 股批量）
+        a_share_codes = [
+            c for c in stock_codes 
+            if not _is_us_code(c) 
+            and not _is_etf_code(c)
+            and not (c.lower().startswith('hk') or (len(c) == 5 and c.isdigit()))
+        ]
+        
+        if not a_share_codes:
+            return {}
+
+        results = {}
+        
+        # 计算日期
+        if end_date is None:
+            end_date = datetime.now().strftime('%Y-%m-%d')
+        if start_date is None:
+            from datetime import timedelta
+            start_dt = datetime.strptime(end_date, '%Y-%m-%d') - timedelta(days=days * 2)
+            start_date = start_dt.strftime('%Y-%m-%d')
+
+        beg_date = start_date.replace('-', '')
+        end_date_fmt = end_date.replace('-', '')
+
+        # 防封禁
+        self._set_random_user_agent()
+        self._enforce_rate_limit()
+        
+        logger.info(f"[API调用] ef.stock.get_quote_history(BATCH, count={len(a_share_codes)})")
+        
+        try:
+            import efinance as ef
+            # efinance 传入列表即可批量获取，返回一个大 DataFrame
+            df_all = ef.stock.get_quote_history(
+                stock_codes=a_share_codes,
+                beg=beg_date,
+                end=end_date_fmt,
+                klt=101,
+                fqt=1
+            )
+            
+            # efinance 有时会返回字典（例如错误信息），此时将其视为空
+            if isinstance(df_all, dict) or df_all is None:
+                logger.warning(f"[批量获取] efinance 返回了非 DataFrame 数据: {type(df_all)}")
+                return {}
+                
+            if df_all.empty:
+                return {}
+                
+            # 按代码拆分
+            # efinance 返回的 DataFrame 包含 '股票代码' 列
+            code_col = '股票代码' if '股票代码' in df_all.columns else 'code'
+            
+            for code, group in df_all.groupby(code_col):
+                # 标准化
+                df_std = self._normalize_data(group, str(code))
+                df_std = self._clean_data(df_std)
+                df_std = self._calculate_indicators(df_std)
+                results[str(code)] = df_std
+                
+            logger.info(f"[批量获取] 成功获取 {len(results)}/{len(a_share_codes)} 只股票的历史数据")
+            return results
+            
+        except Exception as e:
+            logger.error(f"[批量获取] efinance 失败: {e}")
+            # 降级：如果不抛出异常，外层可以用循环单个获取作为兜底？
+            # 这里抛出异常让外层处理
+            raise DataFetchError(f"efinance 批量获取失败: {e}")
     
     def _fetch_etf_data(self, stock_code: str, start_date: str, end_date: str) -> pd.DataFrame:
         """

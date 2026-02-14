@@ -131,6 +131,26 @@ class BaseFetcher(ABC):
         """
         pass
 
+    def get_daily_data_batch(
+        self,
+        stock_codes: List[str],
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        days: int = 30
+    ) -> Dict[str, pd.DataFrame]:
+        """
+        批量获取日线数据（如果子类支持，应覆盖此方法以提升性能）
+        默认实现为循环调用 get_daily_data
+        """
+        results = {}
+        for code in stock_codes:
+            try:
+                df = self.get_daily_data(code, start_date, end_date, days)
+                results[code] = df
+            except Exception:
+                pass
+        return results
+
     def get_main_indices(self) -> Optional[List[Dict[str, Any]]]:
         """
         获取主要指数实时行情
@@ -448,6 +468,66 @@ class DataFetcherManager:
         logger.error(error_summary)
         raise DataFetchError(error_summary)
     
+    def get_daily_data_batch(
+        self,
+        stock_codes: List[str],
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        days: int = 30
+    ) -> Dict[str, Tuple[pd.DataFrame, str]]:
+        """
+        批量获取日线数据（自动切换与重试）
+        
+        Args:
+            stock_codes: 股票代码列表
+            
+        Returns:
+            Dict[str, Tuple[pd.DataFrame, str]]: 
+            {
+                code: (DataFrame, source_name)
+            }
+        """
+        stock_codes = [normalize_stock_code(c) for c in stock_codes]
+        pending_codes = set(stock_codes)
+        results = {}
+        
+        # 1. 优先尝试支持且优先级高的数据源进行批量获取
+        for fetcher in self._fetchers:
+            if not pending_codes:
+                break
+                
+            # 只有部分 fetcher 实现了高效的 batch 接口（目前仅 efinance）
+            # 我们检查 fetcher 是否覆盖了 get_daily_data_batch
+            # 简单判断：只有 EfinanceFetcher 覆盖了
+            if fetcher.name == "EfinanceFetcher":
+                try:
+                    logger.info(f"[{fetcher.name}] 尝试批量获取 {len(pending_codes)} 只股票...")
+                    batch_data = fetcher.get_daily_data_batch(
+                        list(pending_codes), start_date, end_date, days
+                    )
+                    
+                    for code, df in batch_data.items():
+                        if not df.empty:
+                            results[code] = (df, fetcher.name)
+                            pending_codes.discard(code)
+                            
+                    logger.info(f"[{fetcher.name}] 批量获取成功 {len(batch_data)} 只")
+                except Exception as e:
+                    logger.warning(f"[{fetcher.name}] 批量获取失败，将降级尝试: {e}")
+        
+        # 2. 对于剩下的股票，使用单只循环兜底（利用 get_daily_data 的自动切换能力）
+        # 也可以并行化，但为了简单起见，这里先串行并在 get_daily_data 内部处理
+        if pending_codes:
+            logger.info(f"剩余 {len(pending_codes)} 只股票未获取，转为逐个获取模式...")
+            for code in list(pending_codes):
+                try:
+                    df, source = self.get_daily_data(code, start_date, end_date, days)
+                    results[code] = (df, source)
+                except Exception as e:
+                    logger.error(f"获取 {code} 失败: {e}")
+        
+        return results
+
     @property
     def available_fetchers(self) -> List[str]:
         """返回可用数据源名称列表"""

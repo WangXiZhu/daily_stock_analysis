@@ -1446,6 +1446,141 @@ class GeminiAnalyzer:
         
         return results
 
+    def analyze_batch_optimized(
+        self,
+        contexts: List[Dict[str, Any]],
+        news_contexts: Optional[Dict[str, str]] = None
+    ) -> Dict[str, AnalysisResult]:
+        """
+        批量分析多只股票 (One-Shot Batch Request)
+        
+        通过将多只股票的数据合并为一个请求发送给 LLM，大幅减少 API 调用次数。
+        
+        Args:
+            contexts: 股票上下文列表
+            news_contexts: 新闻上下文映射 {code: news_content}
+            
+        Returns:
+            Dict[code, AnalysisResult]
+        """
+        if not contexts:
+            return {}
+            
+        import json
+        from json_repair import repair_json
+        
+        # 1. 构建批量 Prompt
+        stocks_data = []
+        for ctx in contexts:
+            code = ctx['code']
+            name = ctx.get('stock_name', '')
+            news = news_contexts.get(code, "") if news_contexts else ""
+            
+            # 简化版 Context，减少 token 消耗，但保留关键决策数据
+            stock_info = {
+                "code": code,
+                "name": name,
+                "price": ctx.get('realtime', {}).get('price'),
+                "change_pct": ctx.get('realtime', {}).get('change_pct'),
+                "trend_context": ctx.get('trend_analysis', {}),
+                "chip_context": ctx.get('chip', {}),
+                "news_summary": news[:1000] if news else "" # 截断每条新闻长度
+            }
+            stocks_data.append(stock_info)
+            
+        prompt = f"""
+请同时分析以下 {len(stocks_data)} 只股票。
+对于每一只股票，请严格按照【系统提示词】要求的【决策仪表盘 JSON 格式】生成分析报告。
+
+输入数据列表：
+{json.dumps(stocks_data, ensure_ascii=False, indent=2)}
+
+重要要求：
+1. 返回结果必须是一个 **JSON 列表** (Array)。
+2. 列表中必须包含 {len(stocks_data)} 个对象，每个对象按顺序对应一只股票。
+3. 每个对象的格式必须与单只股票分析的格式完全一致（包含 dashboard, sentiment_score 等所有字段）。
+4. 请确保每个结果对象中包含正确的 code 字段。
+"""
+        
+        # 2. 调用 LLM
+        try:
+            config = get_config()
+            # 动态调整 max_output_tokens
+            # 单只股票约需 1000-1500 tokens，稍微给宽裕点
+            estimated_tokens = 1500 * len(stocks_data)
+            generation_config = {
+                "temperature": config.gemini_temperature,
+                "top_p": 0.95,
+                "top_k": 40,
+                "max_output_tokens": min(estimated_tokens, 8192), # Gemini Flash 最大支持 8192 output? 不，Flash 1.5 支持 8k，2.0/Flash 支持更多。这里保守点。
+                # 注意：大部分模型的 output limit 是 4k 或 8k。
+                # 如果 5 只股票 x 1.5k = 7.5k，接近 8k 极限。
+                # 建议 batch size 不要超过 5。
+                "response_mime_type": "application/json",
+            }
+            
+            # 调用 API
+            response_text = self._call_api_with_retry(prompt, generation_config)
+            
+            # 3. 解析结果
+            results_map = {}
+            try:
+                # 修复可能的不标准 JSON
+                repaired_json = repair_json(response_text)
+                results_list = json.loads(repaired_json)
+                
+                # 处理被包裹的情况
+                if isinstance(results_list, dict):
+                    # 有些模型喜欢包一层 {"results": [...]}
+                    for key in results_list:
+                        if isinstance(results_list[key], list):
+                            results_list = results_list[key]
+                            break
+                    
+                if not isinstance(results_list, list):
+                     logger.error(f"[Batch] AI 返回的不是列表格式: {type(results_list)}")
+                     return {}
+                
+                # 4. 转换为 AnalysisResult 对象
+                for item in results_list:
+                    code = item.get('code')
+                    if not code: continue
+                    
+                    # 查找对应的 context 以获取原始名称
+                    original_ctx = next((c for c in contexts if c['code'] == code), {})
+                    name = original_ctx.get('stock_name', item.get('stock_name', ''))
+                    
+                    result_obj = AnalysisResult(
+                        code=code,
+                        name=name,
+                        sentiment_score=int(item.get('sentiment_score', 50)),
+                        trend_prediction=item.get('trend_prediction', '震荡'),
+                        operation_advice=item.get('operation_advice', '观望'),
+                        decision_type=item.get('decision_type', 'hold'),
+                        confidence_level=item.get('confidence_level', '中'),
+                        dashboard=item.get('dashboard', {}),
+                        # 填充其他字段
+                        trend_analysis=item.get('trend_analysis', ''),
+                        analysis_summary=item.get('analysis_summary', ''),
+                        key_points=item.get('key_points', ''),
+                        risk_warning=item.get('risk_warning', ''),
+                        buy_reason=item.get('buy_reason', ''),
+                        raw_response=json.dumps(item, ensure_ascii=False),
+                        search_performed=True if news_contexts and code in news_contexts else False,
+                        data_sources="Batch Analysis"
+                    )
+                    results_map[str(code)] = result_obj
+
+            except Exception as parse_error:
+                logger.error(f"[Batch] JSON 解析失败: {parse_error}")
+                # 降级：如果不抛出，则这一批都失败
+                
+            return results_map
+
+        except Exception as e:
+            logger.error(f"[Batch] 批量分析 API 调用失败: {e}")
+            return {}
+
 
 # 便捷函数
 def get_analyzer() -> GeminiAnalyzer:

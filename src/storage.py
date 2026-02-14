@@ -37,6 +37,7 @@ from sqlalchemy import (
     and_,
     desc,
 )
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import (
     declarative_base,
     sessionmaker,
@@ -529,6 +530,19 @@ class DatabaseManager:
             
             return list(results)
 
+    def get_latest_date(self, code: str) -> Optional[date]:
+        """
+        获取指定股票在数据库中的最新日期
+        """
+        with self.get_session() as session:
+            result = session.execute(
+                select(StockDaily.date)
+                .where(StockDaily.code == code)
+                .order_by(desc(StockDaily.date))
+                .limit(1)
+            ).scalar_one_or_none()
+            return result
+
     def save_news_intel(
         self,
         code: str,
@@ -540,101 +554,90 @@ class DatabaseManager:
     ) -> int:
         """
         保存新闻情报到数据库
-
-        去重策略：
-        - 优先按 URL 去重（唯一约束）
-        - URL 缺失时按 title + source + published_date 进行软去重
-
-        关联策略：
-        - query_context 记录用户查询信息（平台、用户、会话、原始指令等）
+        
+        策略：
+        - 批量处理
+        - 使用 UPSERT 逻辑
         """
         if not response or not response.results:
             return 0
-
+            
         saved_count = 0
+        data_to_upsert = []
+        query_context = query_context or {}
+        
+        for item in response.results:
+            title = (item.title or '').strip()
+            url = (item.url or '').strip()
+            source = (item.source or '').strip()
+            snippet = (item.snippet or '').strip()
+            published_date = self._parse_published_date(item.published_date)
+            
+            if not title and not url:
+                continue
+                
+            url_key = url or self._build_fallback_url_key(
+                code=code,
+                title=title,
+                source=source,
+                published_date=published_date
+            )
+            
+            record = {
+                'code': code,
+                'name': name,
+                'dimension': dimension,
+                'query': query,
+                'provider': response.provider,
+                'title': title,
+                'snippet': snippet,
+                'url': url_key,
+                'source': source,
+                'published_date': published_date,
+                'fetched_at': datetime.now(),
+                'query_id': query_context.get("query_id"),
+                'query_source': query_context.get("query_source"),
+                'requester_platform': query_context.get("requester_platform"),
+                'requester_user_id': query_context.get("requester_user_id"),
+                'requester_user_name': query_context.get("requester_user_name"),
+                'requester_chat_id': query_context.get("requester_chat_id"),
+                'requester_message_id': query_context.get("requester_message_id"),
+                'requester_query': query_context.get("requester_query"),
+            }
+            data_to_upsert.append(record)
+            
+        if not data_to_upsert:
+             return 0
 
         with self.get_session() as session:
             try:
-                for item in response.results:
-                    title = (item.title or '').strip()
-                    url = (item.url or '').strip()
-                    source = (item.source or '').strip()
-                    snippet = (item.snippet or '').strip()
-                    published_date = self._parse_published_date(item.published_date)
-
-                    if not title and not url:
-                        continue
-
-                    url_key = url or self._build_fallback_url_key(
-                        code=code,
-                        title=title,
-                        source=source,
-                        published_date=published_date
-                    )
-
-                    # 优先按 URL 或兜底键去重
-                    existing = session.execute(
-                        select(NewsIntel).where(NewsIntel.url == url_key)
-                    ).scalar_one_or_none()
-
-                    if existing:
-                        existing.name = name or existing.name
-                        existing.dimension = dimension or existing.dimension
-                        existing.query = query or existing.query
-                        existing.provider = response.provider or existing.provider
-                        existing.snippet = snippet or existing.snippet
-                        existing.source = source or existing.source
-                        existing.published_date = published_date or existing.published_date
-                        existing.fetched_at = datetime.now()
-
-                        if query_context:
-                            existing.query_id = query_context.get("query_id") or existing.query_id
-                            existing.query_source = query_context.get("query_source") or existing.query_source
-                            existing.requester_platform = query_context.get("requester_platform") or existing.requester_platform
-                            existing.requester_user_id = query_context.get("requester_user_id") or existing.requester_user_id
-                            existing.requester_user_name = query_context.get("requester_user_name") or existing.requester_user_name
-                            existing.requester_chat_id = query_context.get("requester_chat_id") or existing.requester_chat_id
-                            existing.requester_message_id = query_context.get("requester_message_id") or existing.requester_message_id
-                            existing.requester_query = query_context.get("requester_query") or existing.requester_query
-                    else:
-                        try:
-                            with session.begin_nested():
-                                record = NewsIntel(
-                                    code=code,
-                                    name=name,
-                                    dimension=dimension,
-                                    query=query,
-                                    provider=response.provider,
-                                    title=title,
-                                    snippet=snippet,
-                                    url=url_key,
-                                    source=source,
-                                    published_date=published_date,
-                                    fetched_at=datetime.now(),
-                                    query_id=(query_context or {}).get("query_id"),
-                                    query_source=(query_context or {}).get("query_source"),
-                                    requester_platform=(query_context or {}).get("requester_platform"),
-                                    requester_user_id=(query_context or {}).get("requester_user_id"),
-                                    requester_user_name=(query_context or {}).get("requester_user_name"),
-                                    requester_chat_id=(query_context or {}).get("requester_chat_id"),
-                                    requester_message_id=(query_context or {}).get("requester_message_id"),
-                                    requester_query=(query_context or {}).get("requester_query"),
-                                )
-                                session.add(record)
-                                session.flush()
-                            saved_count += 1
-                        except IntegrityError:
-                            # 单条 URL 唯一约束冲突（如并发插入），仅跳过本条，保留本批其余成功项
-                            logger.debug("新闻情报重复（已跳过）: %s %s", code, url_key)
-
+                stmt = sqlite_insert(NewsIntel).values(data_to_upsert)
+                
+                # 定义冲突更新策略（除 id 和 url 外的字段）
+                update_dict = {
+                    col.name: col 
+                    for col in stmt.excluded 
+                    if col.name not in ['id', 'url', 'code'] # code 一般不变，也可不更
+                }
+                
+                # 仅更新 fetched_at 和 query 相关信息，或者全部更新？
+                # 这里逻辑是：如果新闻已存在，更新其最新状态和关联的本次查询信息
+                
+                stmt = stmt.on_conflict_do_update(
+                    index_elements=['url'], # 依赖 url 唯一索引
+                    set_=update_dict
+                )
+                
+                result = session.execute(stmt)
                 session.commit()
-                logger.info(f"保存新闻情报成功: {code}, 新增 {saved_count} 条")
-
+                saved_count = result.rowcount
+                logger.info(f"批量保存新闻情报成功: {code}, 处理 {len(data_to_upsert)} 条")
+                
             except Exception as e:
                 session.rollback()
                 logger.error(f"保存新闻情报失败: {e}")
-                raise
-
+                return 0
+                
         return saved_count
 
     def get_recent_news(self, code: str, days: int = 7, limit: int = 20) -> List[NewsIntel]:
@@ -859,7 +862,7 @@ class DatabaseManager:
         
         策略：
         - 使用 UPSERT 逻辑（存在则更新，不存在则插入）
-        - 跳过已存在的数据，避免重复
+        - 批量处理以提升性能
         
         Args:
             df: 包含日线数据的 DataFrame
@@ -874,72 +877,78 @@ class DatabaseManager:
             return 0
         
         saved_count = 0
+        data_to_upsert = []
         
-        with self.get_session() as session:
-            try:
-                for _, row in df.iterrows():
-                    # 解析日期
-                    row_date = row.get('date')
-                    if isinstance(row_date, str):
+        # 预处理数据
+        try:
+            for _, row in df.iterrows():
+                # 解析日期
+                row_date = row.get('date')
+                if isinstance(row_date, str):
+                    try:
                         row_date = datetime.strptime(row_date, '%Y-%m-%d').date()
-                    elif isinstance(row_date, datetime):
-                        row_date = row_date.date()
-                    elif isinstance(row_date, pd.Timestamp):
-                        row_date = row_date.date()
-                    
-                    # 检查是否已存在
-                    existing = session.execute(
-                        select(StockDaily).where(
-                            and_(
-                                StockDaily.code == code,
-                                StockDaily.date == row_date
-                            )
-                        )
-                    ).scalar_one_or_none()
-                    
-                    if existing:
-                        # 更新现有记录
-                        existing.open = row.get('open')
-                        existing.high = row.get('high')
-                        existing.low = row.get('low')
-                        existing.close = row.get('close')
-                        existing.volume = row.get('volume')
-                        existing.amount = row.get('amount')
-                        existing.pct_chg = row.get('pct_chg')
-                        existing.ma5 = row.get('ma5')
-                        existing.ma10 = row.get('ma10')
-                        existing.ma20 = row.get('ma20')
-                        existing.volume_ratio = row.get('volume_ratio')
-                        existing.data_source = data_source
-                        existing.updated_at = datetime.now()
-                    else:
-                        # 创建新记录
-                        record = StockDaily(
-                            code=code,
-                            date=row_date,
-                            open=row.get('open'),
-                            high=row.get('high'),
-                            low=row.get('low'),
-                            close=row.get('close'),
-                            volume=row.get('volume'),
-                            amount=row.get('amount'),
-                            pct_chg=row.get('pct_chg'),
-                            ma5=row.get('ma5'),
-                            ma10=row.get('ma10'),
-                            ma20=row.get('ma20'),
-                            volume_ratio=row.get('volume_ratio'),
-                            data_source=data_source,
-                        )
-                        session.add(record)
-                        saved_count += 1
+                    except ValueError:
+                        # 尝试其它常见格式或跳过
+                        logger.warning(f"无法解析日期格式: {row_date}, 跳过该行")
+                        continue
+                elif isinstance(row_date, datetime):
+                    row_date = row_date.date()
+                elif isinstance(row_date, pd.Timestamp):
+                    row_date = row_date.date()
                 
+                if not row_date:
+                    continue
+                
+                # 构建记录字典
+                record = {
+                    'code': code,
+                    'date': row_date,
+                    'open': row.get('open'),
+                    'high': row.get('high'),
+                    'low': row.get('low'),
+                    'close': row.get('close'),
+                    'volume': row.get('volume'),
+                    'amount': row.get('amount'),
+                    'pct_chg': row.get('pct_chg'),
+                    'ma5': row.get('ma5'),
+                    'ma10': row.get('ma10'),
+                    'ma20': row.get('ma20'),
+                    'volume_ratio': row.get('volume_ratio'),
+                    'data_source': data_source,
+                    'updated_at': datetime.now()  # 更新时间
+                }
+                data_to_upsert.append(record)
+            
+            if not data_to_upsert:
+                return 0
+
+            with self.get_session() as session:
+                # 使用 SQLite 原生 UPSERT 语法
+                stmt = sqlite_insert(StockDaily).values(data_to_upsert)
+                
+                # 定义冲突更新策略
+                update_dict = {
+                    col.name: col 
+                    for col in stmt.excluded 
+                    if col.name not in ['id', 'code', 'date', 'created_at']
+                }
+                
+                # 执行 UPSERT
+                stmt = stmt.on_conflict_do_update(
+                    index_elements=['code', 'date'],
+                    set_=update_dict
+                )
+                
+                result = session.execute(stmt)
                 session.commit()
-                logger.info(f"保存 {code} 数据成功，新增 {saved_count} 条")
                 
-            except Exception as e:
-                session.rollback()
-                logger.error(f"保存 {code} 数据失败: {e}")
-                raise
+                saved_count = result.rowcount
+                logger.info(f"批量保存 {code} 数据成功，处理 {len(data_to_upsert)} 条记录")
+                
+        except Exception as e:
+            logger.error(f"批量保存 {code} 数据失败: {e}")
+            # 不再抛出异常阻断流程，仅记录错误
+            return 0
         
         return saved_count
     

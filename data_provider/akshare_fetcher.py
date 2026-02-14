@@ -83,6 +83,13 @@ _etf_realtime_cache: Dict[str, Any] = {
     'ttl': 1200  # 20分钟缓存有效期
 }
 
+# 港股实时行情缓存
+_hk_realtime_cache: Dict[str, Any] = {
+    'data': None,
+    'timestamp': 0,
+    'ttl': 1200  # 20 minutes
+}
+
 
 def _is_etf_code(stock_code: str) -> bool:
     """
@@ -1117,45 +1124,139 @@ class AkshareFetcher(BaseFetcher):
                        f"换手率={quote.turnover_rate}%")
             return quote
             
+
         except Exception as e:
             logger.error(f"[API错误] 获取 ETF {stock_code} 实时行情失败: {e}")
             circuit_breaker.record_failure(source_key, str(e))
             return None
-    
-    def _get_hk_realtime_quote(self, stock_code: str) -> Optional[UnifiedRealtimeQuote]:
+
+    def _get_hk_realtime_quote_tencent(self, stock_code: str) -> Optional[UnifiedRealtimeQuote]:
         """
-        获取港股实时行情数据
+        获取港股实时行情 (腾讯直连)
         
-        数据来源：ak.stock_hk_spot_em()
-        包含：最新价、涨跌幅、成交量、成交额等
+        优点：单股票查询，速度快，无需全量拉取
+        接口：http://qt.gtimg.cn/q=hk00700
+        """
+        circuit_breaker = get_realtime_circuit_breaker()
+        source_key = "tencent_hk"
         
-        Args:
-            stock_code: 港股代码
+        try:
+            import requests
+            # 确保代码格式正确（hk + 5位数字）
+            # stock_code 可能是 'hk00700' 或 '00700'
+            code_num = stock_code.lower().replace('hk', '').zfill(5)
+            symbol = f"hk{code_num}"
             
-        Returns:
-            UnifiedRealtimeQuote 对象，获取失败返回 None
+            url = f"http://qt.gtimg.cn/q={symbol}"
+            headers = {
+                'Referer': 'http://finance.qq.com',
+                'User-Agent': random.choice(USER_AGENTS)
+            }
+            
+            logger.info(f"[API调用] 腾讯接口(HK)获取 {stock_code} 实时行情...")
+            self._enforce_rate_limit()
+            
+            response = requests.get(url, headers=headers, timeout=10)
+            if response.status_code != 200:
+                circuit_breaker.record_failure(source_key, f"HTTP {response.status_code}")
+                return None
+            
+            content = response.text.strip()
+            if '=""' in content or not content:
+                logger.warning(f"[API返回] 腾讯接口未找到 {stock_code} 数据")
+                return None
+                
+            # Parse content: v_hk00700="100~腾讯控股~00700~308.800..."
+            data_start = content.find('"')
+            data_end = content.rfind('"')
+            if data_start == -1 or data_end == -1:
+                return None
+                
+            data_str = content[data_start+1:data_end]
+            fields = data_str.split('~')
+            
+            if len(fields) < 50:
+                logger.warning(f"[API返回] 腾讯HK接口字段不足: {len(fields)}")
+                return None
+            
+            circuit_breaker.record_success(source_key)
+            
+            # Field Mapping (based on test):
+            # 1: Name, 2: Code, 3: Current, 4: PreClose, 5: Open
+            # 6: Volume, 37: Amount, 31: ChangeAmt, 32: ChangePct
+            # 33: High, 34: Low, 39: PE, 43: Amplitude, 44: TotalMV
+            # 48: 52wHigh, 49: 52wLow
+            
+            price = safe_float(fields[3])
+            quote = UnifiedRealtimeQuote(
+                code=stock_code,
+                name=fields[1],
+                source=RealtimeSource.TENCENT,
+                price=price,
+                change_pct=safe_float(fields[32]),
+                change_amount=safe_float(fields[31]),
+                volume=safe_int(fields[6]),
+                amount=safe_float(fields[37]),
+                open_price=safe_float(fields[5]),
+                pre_close=safe_float(fields[4]),
+                high=safe_float(fields[33]),
+                low=safe_float(fields[34]),
+                pe_ratio=safe_float(fields[39]),
+                amplitude=safe_float(fields[43]),
+                total_mv=safe_float(fields[44]), # unit might be different, assume raw or handled by display
+                high_52w=safe_float(fields[48]),
+                low_52w=safe_float(fields[49])
+            )
+            
+            logger.info(f"[港股实时-腾讯] {quote.name}({quote.code}): 价格={quote.price}, 涨跌={quote.change_pct}%")
+            return quote
+            
+        except Exception as e:
+            logger.error(f"[API错误] 腾讯HK接口失败: {e}")
+            circuit_breaker.record_failure(source_key, str(e))
+            return None
+
+    def _get_hk_realtime_quote_em(self, stock_code: str) -> Optional[UnifiedRealtimeQuote]:
+        """
+        获取港股实时行情数据 (东财全量接口)
         """
         import akshare as ak
         circuit_breaker = get_realtime_circuit_breaker()
         source_key = "akshare_hk"
         
         try:
-            # 防封禁策略
-            self._set_random_user_agent()
-            self._enforce_rate_limit()
+            # Check cache (using global variable)
+            current_time = time.time()
+            df = None
+            if (_hk_realtime_cache['data'] is not None and 
+                current_time - _hk_realtime_cache['timestamp'] < _hk_realtime_cache['ttl']):
+                df = _hk_realtime_cache['data']
+                cache_age = int(current_time - _hk_realtime_cache['timestamp'])
+                logger.debug(f"[缓存命中] 港股实时行情 - 缓存年龄 {cache_age}s/{_hk_realtime_cache['ttl']}s")
+            else:
+                # Cache miss, fetch full market
+                # Anti-ban strategy
+                self._set_random_user_agent()
+                self._enforce_rate_limit()
+                
+                logger.info(f"[API调用] ak.stock_hk_spot_em() 获取全量港股实时行情(慢速)...")
+                import time as _time
+                api_start = _time.time()
+                
+                df = ak.stock_hk_spot_em()
+                
+                api_elapsed = _time.time() - api_start
+                logger.info(f"[API返回] ak.stock_hk_spot_em 成功: 返回 {len(df)} 只港股, 耗时 {api_elapsed:.2f}s")
+                circuit_breaker.record_success(source_key)
+                
+                # Update cache
+                if df is not None:
+                     _hk_realtime_cache['data'] = df
+                     _hk_realtime_cache['timestamp'] = current_time
+                     logger.info(f"[缓存更新] 港股实时行情缓存已刷新")
             
             # 确保代码格式正确（5位数字）
             code = stock_code.lower().replace('hk', '').zfill(5)
-            
-            logger.info(f"[API调用] ak.stock_hk_spot_em() 获取港股实时行情...")
-            import time as _time
-            api_start = _time.time()
-            
-            df = ak.stock_hk_spot_em()
-            
-            api_elapsed = _time.time() - api_start
-            logger.info(f"[API返回] ak.stock_hk_spot_em 成功: 返回 {len(df)} 只港股, 耗时 {api_elapsed:.2f}s")
-            circuit_breaker.record_success(source_key)
             
             # 查找指定港股
             row = df[df['代码'] == code]
@@ -1165,7 +1266,6 @@ class AkshareFetcher(BaseFetcher):
             
             row = row.iloc[0]
             
-            # 使用 realtime_types.py 中的统一转换函数
             # 港股行情数据构建
             quote = UnifiedRealtimeQuote(
                 code=stock_code,
@@ -1187,14 +1287,28 @@ class AkshareFetcher(BaseFetcher):
                 low_52w=safe_float(row.get('52周最低')),
             )
             
-            logger.info(f"[港股实时行情] {stock_code} {quote.name}: 价格={quote.price}, 涨跌={quote.change_pct}%, "
-                       f"换手率={quote.turnover_rate}%")
+            logger.info(f"[港股实时-东财] {stock_code} {quote.name}: 价格={quote.price}, 涨跌={quote.change_pct}%")
             return quote
             
         except Exception as e:
-            logger.error(f"[API错误] 获取港股 {stock_code} 实时行情失败: {e}")
+            logger.error(f"[API错误] 获取港股 {stock_code} 实时行情(东财)失败: {e}")
             circuit_breaker.record_failure(source_key, str(e))
             return None
+
+    def _get_hk_realtime_quote(self, stock_code: str) -> Optional[UnifiedRealtimeQuote]:
+        """统一获取港股实时行情（优先腾讯，失败降级东财）"""
+        # 1. Try Tencent (Single stock, fast)
+        quote = self._get_hk_realtime_quote_tencent(stock_code)
+        if quote:
+            return quote
+            
+        # 2. Fallback to EM (Full market, cached, slow on first miss)
+        logger.info(f"腾讯接口获取 {stock_code} 失败，降级使用东财全量接口")
+        return self._get_hk_realtime_quote_em(stock_code)
+            
+
+
+
     
     def get_chip_distribution(self, stock_code: str) -> Optional[ChipDistribution]:
         """

@@ -63,6 +63,9 @@ class Config:
     gemini_model: str = "gemini-3-flash-preview"  # 主模型
     gemini_model_fallback: str = "gemini-2.5-flash"  # 备选模型
     gemini_temperature: float = 0.7  # 温度参数（0.0-2.0，控制输出随机性，默认0.7）
+    
+    # 批量分析大小 (1-10)
+    batch_size: int = 10
 
     # Gemini API 请求配置（防止 429 限流）
     gemini_request_delay: float = 2.0  # 请求间隔（秒）
@@ -307,11 +310,43 @@ class Config:
         
         # 解析自选股列表（逗号分隔）
         stock_list_str = os.getenv('STOCK_LIST', '')
-        stock_list = [
+        raw_stock_list = [
             code.strip() 
             for code in stock_list_str.split(',') 
             if code.strip()
         ]
+        
+        # Normalize stock codes
+        stock_list = []
+        for code in raw_stock_list:
+            # Handle Yahoo/Tushare style codes
+            upper_code = code.upper()
+            if upper_code.endswith('.HK'):
+                # 09988.HK -> hk09988
+                norm_code = 'hk' + upper_code[:-3]
+            elif upper_code.endswith('.SH'):
+                # 600519.SH -> sh600519
+                norm_code = 'sh' + upper_code[:-3]
+            elif upper_code.endswith('.SZ'):
+                # 000001.SZ -> sz000001
+                norm_code = 'sz' + upper_code[:-3]
+            elif upper_code.startswith('HK') and code[2:].isdigit():
+                 # HK09988 -> hk09988
+                 norm_code = code.lower()
+            elif len(code) == 5 and code.isdigit():
+                 # 09988 -> hk09988 (Assume 5 digits is HK)
+                 norm_code = 'hk' + code
+            elif upper_code.startswith(('SH', 'SZ')) and code[2:].isdigit():
+                 # SH600519 -> sh600519
+                 norm_code = code.lower()
+            elif upper_code.replace('.', '').isalpha():
+                 # US stocks usually all letters (maybe dots like BRK.B)
+                 norm_code = upper_code
+            else:
+                 # Default (A-shares usually 6 digits)
+                 norm_code = code
+            
+            stock_list.append(norm_code)
         
         # 如果没有配置，使用默认的示例股票
         if not stock_list:
@@ -350,6 +385,7 @@ class Config:
             gemini_model=os.getenv('GEMINI_MODEL', 'gemini-3-flash-preview'),
             gemini_model_fallback=os.getenv('GEMINI_MODEL_FALLBACK', 'gemini-2.5-flash'),
             gemini_temperature=float(os.getenv('GEMINI_TEMPERATURE', '0.7')),
+            batch_size=int(os.getenv('BATCH_SIZE', '1')),
             gemini_request_delay=float(os.getenv('GEMINI_REQUEST_DELAY', '2.0')),
             gemini_max_retries=int(os.getenv('GEMINI_MAX_RETRIES', '5')),
             gemini_retry_delay=float(os.getenv('GEMINI_RETRY_DELAY', '5.0')),

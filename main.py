@@ -248,8 +248,8 @@ def run_full_analysis(
             # 只调用一次，并获取结果
             review_result = run_market_review(
                 notifier=pipeline.notifier,
-                analyzer=pipeline.analyzer,
-                search_service=pipeline.search_service,
+                analyzer=pipeline.analysis_engine.analyzer,
+                search_service=pipeline.analysis_engine.search_service,
                 send_notification=not args.no_notify
             )
             # 如果有结果，赋值给 market_report 用于后续飞书文档生成
