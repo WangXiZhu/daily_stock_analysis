@@ -132,101 +132,81 @@ class StockSelector:
 
     def get_top_sectors(self, from_overview=None) -> List[Dict]:
         """
-        获取领涨板块列表（多数据源 fallback）
+        获取领涨板块列表
 
         优先级：
         1. MarketOverview 已有数据（最优，无额外请求）
-        2. AkShare 东财概念板块 (stock_board_concept_name_em)
-        3. AkShare 东财行业板块 (stock_board_industry_name_em)
-        4. AkShare 新浪概念板块 (stock_board_concept_name_ths)
-        5. 返回空列表（上游记录日志）
+        2. MarketAnalyzer.get_market_overview()：复用 DataFetcherManager
+           内置随机 UA + 限速 + 新浪兜底，比裸调 AkShare 稳定得多
+        3. 直接裸调 AkShare（仅最后兜底，基本不会走到这里）
 
         Args:
-            from_overview: MarketOverview 对象（如果已有，直接复用，避免重复请求）
+            from_overview: MarketOverview 对象（已有时直接复用）
 
         Returns:
             板块列表，每项含 name, change_pct, type
         """
-        # 优先使用已有的大盘复盘数据
+        # ── 路径1: 直接复用已有数据（大盘复盘已拉取过，零额外网络请求）──
         if from_overview and hasattr(from_overview, 'top_sectors') and from_overview.top_sectors:
+            sectors = [
+                {**s, 'type': s.get('type', 'industry')}
+                for s in from_overview.top_sectors[:self.TOP_SECTORS]
+            ]
             logger.info(
-                f"[选股] 复用大盘复盘数据，领涨板块: "
-                f"{[s['name'] for s in from_overview.top_sectors[:self.TOP_SECTORS]]}"
+                f"[选股] 复用大盘复盘数据，领涨板块: {[s['name'] for s in sectors]}"
             )
-            return from_overview.top_sectors[:self.TOP_SECTORS]
+            return sectors
 
-        logger.info("[选股] 独立获取板块涨跌数据（多数据源 fallback）...")
-
-        # --- 数据源1: 东财概念板块 ---
+        # ── 路径2: 调用 MarketAnalyzer（使用 DataFetcherManager 含随机UA+限速+新浪兜底）──
+        logger.info("[选股] 通过 MarketAnalyzer 获取板块数据（含随机UA + 新浪兜底）...")
         try:
-            sectors = self._fetch_em_concept_sectors()
-            if sectors:
+            from src.market_analyzer import MarketAnalyzer
+            ma = MarketAnalyzer()
+            overview = ma.get_market_overview()
+            if overview and overview.top_sectors:
+                sectors = [
+                    {**s, 'type': s.get('type', 'industry')}
+                    for s in overview.top_sectors[:self.TOP_SECTORS]
+                ]
+                logger.info(
+                    f"[选股] MarketAnalyzer 板块获取成功: {[s['name'] for s in sectors]}"
+                )
                 return sectors
+            else:
+                logger.warning("[选股] MarketAnalyzer 未返回板块数据")
         except Exception as e:
-            logger.warning(f"[选股] 东财概念板块失败: {e}")
+            logger.warning(f"[选股] MarketAnalyzer 获取板块失败: {e}")
 
-        # --- 数据源2: 东财行业板块 ---
+        # ── 路径3: 裸调 AkShare 新浪板块接口（最后兜底）──
+        logger.info("[选股] 尝试新浪板块接口兜底...")
         try:
-            sectors = self._get_industry_sectors()
-            if sectors:
-                return sectors
+            ak = self._get_ak()
+            self._sleep(2)
+            df = ak.stock_sector_spot(indicator='新浪行业')
+            if df is not None and not df.empty:
+                name_col = next((c for c in ['板块', '板块名称', 'label', 'name'] if c in df.columns), None)
+                chg_col = next((c for c in ['涨跌幅', 'change_pct', '涨幅'] if c in df.columns), None)
+                if name_col and chg_col:
+                    import pandas as pd
+                    df[chg_col] = pd.to_numeric(df[chg_col], errors='coerce')
+                    df = df.dropna(subset=[chg_col]).sort_values(chg_col, ascending=False)
+                    sectors = []
+                    for _, row in df.head(self.TOP_SECTORS).iterrows():
+                        name = str(row[name_col])
+                        pct = float(row[chg_col])
+                        if name:
+                            sectors.append({'name': name, 'change_pct': pct, 'type': 'sina'})
+                    if sectors:
+                        logger.info(f"[选股] 新浪板块兜底成功: {[s['name'] for s in sectors]}")
+                        return sectors
         except Exception as e:
-            logger.warning(f"[选股] 东财行业板块失败: {e}")
-
-        # --- 数据源3: 同花顺概念板块 ---
-        try:
-            sectors = self._fetch_ths_concept_sectors()
-            if sectors:
-                return sectors
-        except Exception as e:
-            logger.warning(f"[选股] 同花顺概念板块失败: {e}")
+            logger.error(f"[选股] 新浪板块兜底也失败: {e}")
 
         logger.error("[选股] 所有板块数据源均失败")
         return []
 
-    def _fetch_em_concept_sectors(self) -> List[Dict]:
-        """东方财富概念板块"""
-        ak = self._get_ak()
-        self._sleep(2)
-        df = ak.stock_board_concept_name_em()
-        if df is None or df.empty:
-            return []
-        col = '涨跌幅' if '涨跌幅' in df.columns else '最新涨跌幅'
-        df = df.sort_values(col, ascending=False)
-        sectors = []
-        for _, row in df.head(self.TOP_SECTORS).iterrows():
-            name = row.get('板块名称', row.get('名称', ''))
-            pct = float(row.get(col, 0) or 0)
-            if name:
-                sectors.append({'name': name, 'change_pct': pct, 'type': 'concept'})
-        if sectors:
-            logger.info(f"[选股] 东财概念板块获取成功: {[s['name'] for s in sectors]}")
-        return sectors
-
-    def _fetch_ths_concept_sectors(self) -> List[Dict]:
-        """同花顺概念板块（备选）"""
-        ak = self._get_ak()
-        self._sleep(2)
-        # 同花顺行业指数
-        df = ak.stock_board_concept_name_ths()
-        if df is None or df.empty:
-            return []
-        col = '涨跌幅' if '涨跌幅' in df.columns else '最新涨跌幅'
-        if col not in df.columns:
-            return []
-        df = df.sort_values(col, ascending=False)
-        sectors = []
-        for _, row in df.head(self.TOP_SECTORS).iterrows():
-            name = row.get('概念名称', row.get('板块名称', row.get('名称', '')))
-            pct = float(row.get(col, 0) or 0)
-            if name:
-                sectors.append({'name': name, 'change_pct': pct, 'type': 'concept_ths'})
-        if sectors:
-            logger.info(f"[选股] 同花顺概念板块获取成功: {[s['name'] for s in sectors]}")
-        return sectors
-
     def _get_industry_sectors(self) -> List[Dict]:
-        """东财行业板块"""
+        """东财行业板块（内部直接调 AkShare，仅作保留）"""
         ak = self._get_ak()
         self._sleep(2)
         df = ak.stock_board_industry_name_em()
@@ -243,7 +223,7 @@ class StockSelector:
             if name:
                 sectors.append({'name': name, 'change_pct': pct, 'type': 'industry'})
         if sectors:
-            logger.info(f"[选股] 东财行业板块获取成功: {[s['name'] for s in sectors]}")
+            logger.info(f"[选股] 东财行业板块成功: {[s['name'] for s in sectors]}")
         return sectors
 
     # =========================================================
@@ -584,31 +564,42 @@ class StockSelector:
         try:
             # 步骤1: 获取领涨板块
             top_sectors = self.get_top_sectors(from_overview=market_overview)
-            if not top_sectors:
-                result.error = "未能获取领涨板块数据"
-                logger.error("[选股] " + result.error)
-                return result
 
-            result.top_sectors = top_sectors
-            logger.info(f"[选股] 步骤1完成 - 领涨板块: {[s['name'] for s in top_sectors]}")
+            if top_sectors:
+                # ── 正常路径：板块联动 + 资金流向 ──
+                result.top_sectors = top_sectors
+                logger.info(f"[选股] 步骤1完成 - 领涨板块: {[s['name'] for s in top_sectors]}")
 
-            # 步骤2: 获取板块内成分股 + 资金流向
-            all_candidates: List[CandidateStock] = []
-            for sector in top_sectors:
-                logger.info(f"[选股] 分析板块: {sector['name']} ({sector['change_pct']:+.2f}%)")
-                stocks = self.get_sector_stocks_with_flow(sector)
-                logger.info(f"[选股] 板块 {sector['name']} 初始候选: {len(stocks)} 只")
-                all_candidates.extend(stocks)
-                self._sleep(2)  # 板块间休眠
+                # 步骤2: 获取板块内成分股 + 资金流向
+                all_candidates: List[CandidateStock] = []
+                for sector in top_sectors:
+                    logger.info(f"[选股] 分析板块: {sector['name']} ({sector['change_pct']:+.2f}%)")
+                    stocks = self.get_sector_stocks_with_flow(sector)
+                    logger.info(f"[选股] 板块 {sector['name']} 初始候选: {len(stocks)} 只")
+                    all_candidates.extend(stocks)
+                    self._sleep(2)
+
+                if not all_candidates:
+                    logger.warning("[选股] 板块成分股为空，切换热度榜兜底")
+                    all_candidates = self._get_candidates_from_hot_rank()
+                    result.data_source = "AkShare（热门股票榜 Top100，板块接口不可用）"
+                else:
+                    result.data_source = "AkShare（东方财富板块数据 + 个股资金流向）"
+
+            else:
+                # ── 兜底路径：热度榜 Top 100（板块接口全部失败时）──
+                logger.warning("[选股] 板块数据不可用，启用热度榜兜底（stock_hot_rank_em）")
+                all_candidates = self._get_candidates_from_hot_rank()
+                result.data_source = "AkShare（热门股票榜 Top100，板块接口不可用）"
 
             if not all_candidates:
-                result.error = "未能获取任何板块成分股数据"
+                result.error = "未能获取任何候选股数据（板块接口和热度榜均失败）"
                 logger.error("[选股] " + result.error)
                 return result
 
             logger.info(f"[选股] 步骤2完成 - 共 {len(all_candidates)} 只初始候选")
 
-            # 步骤3: 补充技术面数据（限速处理）
+            # 步骤3: 补充技术面数据
             enriched = []
             for i, stock in enumerate(all_candidates):
                 logger.debug(f"[选股] 获取技术数据 {i+1}/{len(all_candidates)}: {stock.name}")
@@ -635,14 +626,12 @@ class StockSelector:
                     seen_codes.add(stock.code)
 
             result.candidates = final
-            result.data_source = "AkShare（东方财富板块数据 + 个股资金流向）"
 
             logger.info(f"[选股] ✅ 选股完成！最终候选 {len(final)} 只:")
             for s in final:
                 bullish_tag = "✅多头" if s.is_ma_bullish else "⚠️非多头"
                 logger.info(
                     f"  [{s.score:.0f}分] {s.name}({s.code}) "
-                    f"净流入:{s.net_inflow:+.1f}亿 "
                     f"换手:{s.turnover_rate:.1f}% "
                     f"乖离:{s.bias_ma5:+.1f}% {bullish_tag}"
                 )
@@ -652,6 +641,64 @@ class StockSelector:
             result.error = str(e)
 
         return result
+
+    def _get_candidates_from_hot_rank(self, top_n: int = 40) -> List[CandidateStock]:
+        """
+        热度榜兜底：从东方财富热门股票榜取 Top N 作为候选池
+
+        当板块接口全不可用时，改用 stock_hot_rank_em() 获取候选。
+        该接口通过不同域名（emappdata.eastmoney.com），稳定性优于板块接口。
+
+        Args:
+            top_n: 取热度榜前 N 只
+
+        Returns:
+            候选股列表（只含基础字段，无资金流和板块分类）
+        """
+        logger.info(f"[选股] 获取热度榜 Top {top_n}...")
+        candidates = []
+        try:
+            ak = self._get_ak()
+            self._sleep(1)
+            df = ak.stock_hot_rank_em()
+            if df is None or df.empty:
+                logger.warning("[选股] 热度榜数据为空")
+                return []
+
+            logger.info(f"[选股] 热度榜获取成功: {len(df)} 只")
+            df = df.head(top_n)
+
+            for _, row in df.iterrows():
+                raw_code = str(row.get('代码', '')).strip()
+                # 去掉 SZ/SH 前缀，只保留 6 位数字
+                code = raw_code[-6:] if len(raw_code) > 6 else raw_code
+                name = str(row.get('股票名称', '')).strip()
+
+                if not code or len(code) != 6:
+                    continue
+                if not code.isdigit():
+                    continue
+                # 排除 ST 股
+                if 'ST' in name.upper() or '*' in name:
+                    continue
+
+                change_pct = float(row.get('涨跌幅', 0) or 0)
+                current_price = float(row.get('最新价', 0) or 0)
+
+                stock = CandidateStock(
+                    code=code,
+                    name=name,
+                    sector='热门榜（板块数据不可用）',
+                    current_price=current_price,
+                    change_pct=change_pct,
+                )
+                candidates.append(stock)
+
+            logger.info(f"[选股] 热度榜候选（去ST后）: {len(candidates)} 只")
+        except Exception as e:
+            logger.error(f"[选股] 热度榜获取失败: {e}")
+
+        return candidates
 
 
 def format_selection_report(result: SelectionResult) -> str:
