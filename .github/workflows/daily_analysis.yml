@@ -14,9 +14,10 @@ on:
         default: 'full'
         type: choice
         options:
-          - full          # 完整分析（股票+大盘）
-          - market-only   # 仅大盘复盘
-          - stocks-only   # 仅股票分析
+          - full               # 完整分析（股票+大盘+智能选股）
+          - market-only        # 仅大盘复盘 + 智能选股
+          - stocks-only        # 仅股票分析（跳过大盘和选股）
+          - stock-select-only  # 仅智能选股（板块联动+资金流向）
 
 # 并发控制：同一时间只运行一个分析任务
 concurrency:
@@ -141,6 +142,8 @@ jobs:
           SINGLE_STOCK_NOTIFY: ${{ vars.SINGLE_STOCK_NOTIFY || secrets.SINGLE_STOCK_NOTIFY || 'false' }}
           MARKET_REVIEW_ENABLED: ${{ vars.MARKET_REVIEW_ENABLED || secrets.MARKET_REVIEW_ENABLED || 'true' }}
           ANALYSIS_DELAY: ${{ vars.ANALYSIS_DELAY || secrets.ANALYSIS_DELAY || '0' }}
+          # 智能选股开关：true=开启（默认），false=关闭
+          STOCK_SELECT_ENABLED: ${{ vars.STOCK_SELECT_ENABLED || secrets.STOCK_SELECT_ENABLED || 'true' }}
           
           # ==========================================
           # 系统配置
@@ -187,13 +190,33 @@ jobs:
           echo "=========================================="
           echo ""
           
-          # 执行分析
-          if [ "$MODE" = "market-only" ]; then
-            python main.py --market-review
-          elif [ "$MODE" = "stocks-only" ]; then
-            python main.py --no-market-review
+          # 智能选股标志（根据 STOCK_SELECT_ENABLED 决定是否追加 --no-stock-select）
+          STOCK_SELECT_FLAG=""
+          if [ "$STOCK_SELECT_ENABLED" = "false" ]; then
+            STOCK_SELECT_FLAG="--no-stock-select"
+            echo "⚪ 智能选股: 已关闭 (STOCK_SELECT_ENABLED=false)"
           else
-            python main.py
+            echo "✅ 智能选股: 已开启"
+          fi
+          echo ""
+
+          # 执行分析
+          if [ "$MODE" = "stock-select-only" ]; then
+            # 仅运行智能选股（板块联动 + 资金流向）
+            echo "🎯 模式: 仅智能选股"
+            python main.py --stock-select-only
+          elif [ "$MODE" = "market-only" ]; then
+            # 大盘复盘 + 智能选股（如果未关闭）
+            echo "📊 模式: 大盘复盘"
+            python main.py --market-review $STOCK_SELECT_FLAG
+          elif [ "$MODE" = "stocks-only" ]; then
+            # 仅个股分析，跳过大盘和选股
+            echo "📈 模式: 仅个股分析"
+            python main.py --no-market-review --no-stock-select
+          else
+            # 完整模式：个股分析 + 大盘复盘 + 智能选股
+            echo "🚀 模式: 完整分析"
+            python main.py $STOCK_SELECT_FLAG
           fi
       
       - name: 上传分析报告

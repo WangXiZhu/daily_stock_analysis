@@ -125,6 +125,18 @@ def parse_arguments() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        '--no-stock-select',
+        action='store_true',
+        help='跳过智能选股（板块联动+资金流向）'
+    )
+
+    parser.add_argument(
+        '--stock-select-only',
+        action='store_true',
+        help='仅运行智能选股，不执行个股分析和大盘复盘'
+    )
+
+    parser.add_argument(
         '--webui',
         action='store_true',
         help='启动 Web 管理界面'
@@ -244,13 +256,15 @@ def run_full_analysis(
 
         # 2. 运行大盘复盘（如果启用且不是仅个股模式）
         market_report = ""
+        run_stock_sel = not getattr(args, 'no_stock_select', False)
         if config.market_review_enabled and not args.no_market_review:
             # 只调用一次，并获取结果
             review_result = run_market_review(
                 notifier=pipeline.notifier,
                 analyzer=pipeline.analysis_engine.analyzer,
                 search_service=pipeline.analysis_engine.search_service,
-                send_notification=not args.no_notify
+                send_notification=not args.no_notify,
+                run_stock_selection=run_stock_sel
             )
             # 如果有结果，赋值给 market_report 用于后续飞书文档生成
             if review_result:
@@ -483,6 +497,21 @@ def main() -> int:
             )
             return 0
 
+        # 模式0.5: 仅智能选股
+        if getattr(args, 'stock_select_only', False):
+            from src.notification import NotificationService
+            from src.stock_selector import StockSelector, format_selection_report
+
+            logger.info("模式: 仅智能选股")
+            notifier = NotificationService()
+            selector = StockSelector()
+            result = selector.run()
+            report = format_selection_report(result)
+            logger.info("\n" + report)
+            if not args.no_notify and notifier.is_available():
+                notifier.send(report)
+            return 0
+
         # 模式1: 仅大盘复盘
         if args.market_review:
             from src.analyzer import GeminiAnalyzer
@@ -513,11 +542,13 @@ def main() -> int:
             else:
                 logger.warning("未检测到 API Key (Gemini/OpenAI)，将仅使用模板生成报告")
             
+            run_stock_sel = not getattr(args, 'no_stock_select', False)
             run_market_review(
                 notifier=notifier, 
                 analyzer=analyzer, 
                 search_service=search_service,
-                send_notification=not args.no_notify
+                send_notification=not args.no_notify,
+                run_stock_selection=run_stock_sel
             )
             return 0
         
