@@ -180,7 +180,7 @@ class AkshareFetcher(BaseFetcher):
     """
     
     name = "AkshareFetcher"
-    priority = int(os.getenv("AKSHARE_PRIORITY", "1"))
+    priority = int(os.getenv("AKSHARE_PRIORITY", "0"))  # 最高优先级（腾讯→新浪→东财）
     
     def __init__(self, sleep_min: float = 2.0, sleep_max: float = 5.0):
         """
@@ -269,15 +269,15 @@ class AkshareFetcher(BaseFetcher):
         获取普通 A 股历史数据
 
         策略：
-        1. 优先尝试东方财富接口 (ak.stock_zh_a_hist)
+        1. 优先尝试腾讯财经接口 (ak.stock_zh_a_hist_tx)
         2. 失败后尝试新浪财经接口 (ak.stock_zh_a_daily)
-        3. 最后尝试腾讯财经接口 (ak.stock_zh_a_hist_tx)
+        3. 最后尝试东方财富接口 (ak.stock_zh_a_hist)
         """
-        # 尝试列表
+        # 尝试列表（腾讯优先 → 新浪 → 东方财富）
         methods = [
-            (self._fetch_stock_data_em, "东方财富"),
-            (self._fetch_stock_data_sina, "新浪财经"),
             (self._fetch_stock_data_tx, "腾讯财经"),
+            (self._fetch_stock_data_sina, "新浪财经"),
+            (self._fetch_stock_data_em, "东方财富"),
         ]
 
         last_error = None

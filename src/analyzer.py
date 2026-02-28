@@ -22,6 +22,19 @@ from src.config import get_config
 logger = logging.getLogger(__name__)
 
 
+def _is_etf_code(stock_code: str) -> bool:
+    """
+    判断代码是否为 ETF 基金
+
+    ETF 代码规则：
+    - 上交所 ETF: 51xxxx, 52xxxx, 56xxxx, 58xxxx
+    - 深交所 ETF: 15xxxx, 16xxxx, 18xxxx
+    """
+    etf_prefixes = ('51', '52', '56', '58', '15', '16', '18')
+    code = stock_code.strip().split('.')[0]
+    return code.startswith(etf_prefixes) and len(code) == 6
+
+
 # 股票名称映射（常见股票）
 STOCK_NAME_MAP = {
     # === A股 ===
@@ -507,6 +520,185 @@ class GeminiAnalyzer:
 4. **检查清单可视化**：用 ✅⚠️❌ 明确显示每项检查结果
 5. **风险优先级**：舆情中的风险点要醒目标出"""
 
+    # ========================================
+    # ETF 专属系统提示词
+    # ========================================
+    # ETF 不同于个股：无筹码分布、无个股基本面
+    # 重点关注：趋势、资金流向、板块轮动、量能
+    # ========================================
+
+    ETF_SYSTEM_PROMPT = """你是一位专注于 ETF 趋势交易的投资分析师，负责生成专业的【ETF 决策仪表盘】分析报告。
+
+## ETF 分析核心理念
+
+### ETF 与个股的关键区别
+- ETF 跟踪指数/板块，不存在个股暴雷风险（无业绩预亏、无股东减持）
+- ETF 更适合趋势交易，波动相对平滑
+- ETF 重点关注：**板块轮动、资金流向、均线趋势、量能变化**
+- ETF 不需要分析：筹码分布、个股基本面、股东变动
+
+### 1. 趋势跟踪策略
+- **多头排列必须条件**：MA5 > MA10 > MA20
+- 只做多头排列的 ETF，空头排列坚决不碰
+- ETF 趋势惯性更强，一旦形成趋势持续时间更长
+- 均线发散上行 > 均线粘合待突破 > 均线空头排列
+
+### 2. 量能分析（ETF 核心指标）
+- **放量突破**：成交额大幅增加 + 价格突破均线，强烈买入信号
+- **缩量回调**：成交额萎缩 + 价格回踩均线支撑，最佳买点
+- **放量下跌**：主力资金出逃信号，警惕
+- **量比 > 2**：异常放量，关注突破方向
+
+### 3. 买点策略（回踩支撑优先）
+- **最佳买点**：缩量回踩 MA5 获得支撑，乖离率 < 2%
+- **次优买点**：回踩 MA10 获得支撑，乖离率 < 3%
+- **突破买点**：放量突破前高/整数关口
+- **严禁追高**：乖离率 > 5% 时坚决不买
+
+### 4. 板块轮动判断
+- 关注所属板块是否处于市场热点
+- 板块资金持续流入 = 趋势延续
+- 板块资金连续流出 = 趋势反转警告
+
+### 5. 风险控制
+- 止损位：跌破 MA20 或下跌 5%
+- 止盈位：乖离率 > 8% 时分批减仓
+- 仓位控制：单只 ETF 不超过总仓位 30%
+
+## 输出格式：ETF 决策仪表盘 JSON
+
+请严格按照以下 JSON 格式输出：
+
+```json
+{
+    "stock_name": "ETF 名称",
+    "sentiment_score": 0-100整数,
+    "trend_prediction": "强烈看多/看多/震荡/看空/强烈看空",
+    "operation_advice": "买入/加仓/持有/减仓/卖出/观望",
+    "decision_type": "buy/hold/sell",
+    "confidence_level": "高/中/低",
+
+    "dashboard": {
+        "core_conclusion": {
+            "one_sentence": "一句话核心结论（30字以内）",
+            "signal_type": "🟢买入信号/🟡持有观望/🔴卖出信号/⚠️风险警告",
+            "time_sensitivity": "立即行动/今日内/本周内/不急",
+            "position_advice": {
+                "no_position": "空仓者建议",
+                "has_position": "持仓者建议"
+            }
+        },
+
+        "data_perspective": {
+            "trend_status": {
+                "ma_alignment": "均线排列状态",
+                "is_bullish": true/false,
+                "trend_score": 0-100
+            },
+            "price_position": {
+                "current_price": 当前价格,
+                "ma5": MA5数值,
+                "ma10": MA10数值,
+                "ma20": MA20数值,
+                "bias_ma5": 乖离率百分比,
+                "bias_status": "安全/警戒/危险",
+                "support_level": 支撑位价格,
+                "resistance_level": 压力位价格
+            },
+            "volume_analysis": {
+                "volume_ratio": 量比数值,
+                "volume_status": "放量/缩量/平量",
+                "turnover_rate": 换手率百分比,
+                "volume_meaning": "量能含义（如：缩量回调，抛压减轻）"
+            },
+            "etf_specific": {
+                "sector_trend": "所属板块趋势判断",
+                "sector_heat": "板块热度：高/中/低",
+                "tracking_index": "跟踪指数描述",
+                "fund_flow_signal": "资金流向信号"
+            }
+        },
+
+        "intelligence": {
+            "latest_news": "【最新消息】近期相关板块/行业新闻",
+            "risk_alerts": ["风险点1", "风险点2"],
+            "positive_catalysts": ["利好1", "利好2"],
+            "sector_outlook": "板块/行业前景分析",
+            "sentiment_summary": "市场情绪总结"
+        },
+
+        "battle_plan": {
+            "sniper_points": {
+                "ideal_buy": "理想买入点：XX元（MA5附近）",
+                "secondary_buy": "次优买入点：XX元（MA10附近）",
+                "stop_loss": "止损位：XX元（跌破MA20）",
+                "take_profit": "目标位：XX元（前高/整数关口）"
+            },
+            "position_strategy": {
+                "suggested_position": "建议仓位",
+                "entry_plan": "建仓策略",
+                "risk_control": "风控策略"
+            },
+            "action_checklist": [
+                "✅/⚠️/❌ 多头排列检查",
+                "✅/⚠️/❌ 乖离率<5%",
+                "✅/⚠️/❌ 量能配合",
+                "✅/⚠️/❌ 板块热度",
+                "✅/⚠️/❌ 无系统性风险"
+            ]
+        }
+    },
+
+    "analysis_summary": "100字综合分析摘要",
+    "key_points": "3-5个核心看点",
+    "risk_warning": "风险提示",
+    "buy_reason": "操作理由",
+
+    "trend_analysis": "走势形态分析",
+    "short_term_outlook": "短期1-3日展望",
+    "medium_term_outlook": "中期1-2周展望",
+    "technical_analysis": "技术面综合分析",
+    "ma_analysis": "均线系统分析",
+    "volume_analysis": "量能分析",
+    "pattern_analysis": "K线形态分析",
+    "fundamental_analysis": "ETF 跟踪指数/板块基本面",
+    "sector_position": "板块轮动位置",
+    "company_highlights": "ETF 投资亮点/风险",
+    "news_summary": "板块新闻摘要",
+    "market_sentiment": "市场情绪",
+    "hot_topics": "相关热点",
+
+    "search_performed": true/false,
+    "data_sources": "数据来源说明"
+}
+```
+
+## ETF 评分标准
+
+### 强烈买入（80-100分）：
+- ✅ 多头排列：MA5 > MA10 > MA20 且发散
+- ✅ 低乖离率：<2%，价格贴近 MA5
+- ✅ 缩量回调后放量上攻 或 放量突破前高
+- ✅ 所属板块处于市场热点
+- ✅ 无重大系统性风险
+
+### 买入（60-79分）：
+- ✅ 多头排列或弱势多头
+- ✅ 乖离率 <5%
+- ✅ 量能正常或温和放量
+- ⚪ 板块热度一般但趋势向上
+
+### 观望（40-59分）：
+- ⚠️ 乖离率 >5%（追高风险）
+- ⚠️ 均线缠绕，趋势不明
+- ⚠️ 板块轮动可能切换
+
+### 卖出/减仓（0-39分）：
+- ❌ 空头排列
+- ❌ 跌破 MA20
+- ❌ 放量下跌
+- ❌ 板块资金持续流出"""
+
     def __init__(self, api_key: Optional[str] = None):
         """
         初始化 AI 分析器
@@ -671,13 +863,14 @@ class GeminiAnalyzer:
         """检查分析器是否可用"""
         return self._model is not None or self._openai_client is not None
 
-    def _call_openai_api(self, prompt: str, generation_config: dict) -> str:
+    def _call_openai_api(self, prompt: str, generation_config: dict, system_prompt: Optional[str] = None) -> str:
         """
         调用 OpenAI 兼容 API
 
         Args:
             prompt: 提示词
             generation_config: 生成配置
+            system_prompt: 系统提示词（可选，默认使用 SYSTEM_PROMPT）
 
         Returns:
             响应文本
@@ -687,10 +880,11 @@ class GeminiAnalyzer:
         base_delay = config.gemini_retry_delay
 
         def _build_base_request_kwargs() -> dict:
+            _sys_prompt = system_prompt or self.SYSTEM_PROMPT
             kwargs = {
                 "model": self._current_model_name,
                 "messages": [
-                    {"role": "system", "content": self.SYSTEM_PROMPT},
+                    {"role": "system", "content": _sys_prompt},
                     {"role": "user", "content": prompt},
                 ],
                 "temperature": generation_config.get('temperature', config.openai_temperature),
@@ -756,7 +950,7 @@ class GeminiAnalyzer:
         
         raise Exception("OpenAI API 调用失败，已达最大重试次数")
     
-    def _call_api_with_retry(self, prompt: str, generation_config: dict) -> str:
+    def _call_api_with_retry(self, prompt: str, generation_config: dict, system_prompt: Optional[str] = None) -> str:
         """
         调用 AI API，带有重试和模型切换机制
         
@@ -770,13 +964,14 @@ class GeminiAnalyzer:
         Args:
             prompt: 提示词
             generation_config: 生成配置
+            system_prompt: 系统提示词（可选，ETF 使用专属提示词）
             
         Returns:
             响应文本
         """
         # 如果已经在使用 OpenAI 模式，直接调用 OpenAI
         if self._use_openai:
-            return self._call_openai_api(prompt, generation_config)
+            return self._call_openai_api(prompt, generation_config, system_prompt=system_prompt)
         
         config = get_config()
         max_retries = config.gemini_max_retries
@@ -794,8 +989,19 @@ class GeminiAnalyzer:
                     logger.info(f"[Gemini] 第 {attempt + 1} 次重试，等待 {delay:.1f} 秒...")
                     time.sleep(delay)
                 
+                # Gemini 的 system_instruction 在模型初始化时设定，
+                # 如果需要使用不同的系统提示词（如 ETF），将其前置到用户 prompt 中
+                actual_prompt = prompt
+                if system_prompt and system_prompt != self.SYSTEM_PROMPT:
+                    actual_prompt = (
+                        "【重要】请忽略之前的股票分析系统提示词，改用以下 ETF 专属分析规则：\n\n"
+                        f"{system_prompt}\n\n"
+                        "---\n\n"
+                        f"{prompt}"
+                    )
+
                 response = self._model.generate_content(
-                    prompt,
+                    actual_prompt,
                     generation_config=generation_config,
                     request_options={"timeout": 120}
                 )
@@ -904,8 +1110,13 @@ class GeminiAnalyzer:
             )
         
         try:
+            # 检测是否为 ETF
+            is_etf = context.get('is_etf', _is_etf_code(code))
+            if is_etf:
+                logger.info(f"[{code}] 检测到 ETF 代码，使用 ETF 专属分析提示词")
+
             # 格式化输入（包含技术面数据和新闻）
-            prompt = self._format_prompt(context, name, news_context)
+            prompt = self._format_prompt(context, name, news_context, is_etf=is_etf)
             
             # 获取模型名称
             model_name = getattr(self, '_current_model_name', None)
@@ -935,9 +1146,12 @@ class GeminiAnalyzer:
             api_provider = "OpenAI" if self._use_openai else "Gemini"
             logger.info(f"[LLM调用] 开始调用 {api_provider} API...")
             
+            # ETF 使用专属系统提示词
+            system_prompt = self.ETF_SYSTEM_PROMPT if is_etf else self.SYSTEM_PROMPT
+
             # 使用带重试的 API 调用
             start_time = time.time()
-            response_text = self._call_api_with_retry(prompt, generation_config)
+            response_text = self._call_api_with_retry(prompt, generation_config, system_prompt=system_prompt)
             elapsed = time.time() - start_time
 
             # 记录响应信息
@@ -977,17 +1191,20 @@ class GeminiAnalyzer:
         self, 
         context: Dict[str, Any], 
         name: str,
-        news_context: Optional[str] = None
+        news_context: Optional[str] = None,
+        is_etf: bool = False
     ) -> str:
         """
         格式化分析提示词（决策仪表盘 v2.0）
         
         包含：技术指标、实时行情（量比/换手率）、筹码分布、趋势分析、新闻
+        ETF 模式下会跳过筹码分布，添加板块/行业信息
         
         Args:
             context: 技术面数据上下文（包含增强数据）
             name: 股票名称（默认值，可能被上下文覆盖）
             news_context: 预先搜索的新闻内容
+            is_etf: 是否为 ETF 基金
         """
         code = context.get('code', 'Unknown')
         
@@ -998,14 +1215,18 @@ class GeminiAnalyzer:
             
         today = context.get('today', {})
         
+        # 资产类型标识
+        asset_type = "ETF 基金" if is_etf else "股票"
+        
         # ========== 构建决策仪表盘格式的输入 ==========
-        prompt = f"""# 决策仪表盘分析请求
+        prompt = f"""# {'ETF ' if is_etf else ''}决策仪表盘分析请求
 
-## 📊 股票基础信息
+## 📊 {'ETF' if is_etf else '股票'}基础信息
 | 项目 | 数据 |
 |------|------|
-| 股票代码 | **{code}** |
-| 股票名称 | **{stock_name}** |
+| {'ETF' if is_etf else '股票'}代码 | **{code}** |
+| {'ETF' if is_etf else '股票'}名称 | **{stock_name}** |
+| 资产类型 | **{asset_type}** |
 | 分析日期 | {context.get('date', '未知')} |
 
 ---
@@ -1049,8 +1270,8 @@ class GeminiAnalyzer:
 | 60日涨跌幅 | {rt.get('change_60d', 'N/A')}% | 中期表现 |
 """
         
-        # 添加筹码分布数据
-        if 'chip' in context:
+        # 添加筹码分布数据（ETF 不适用）
+        if 'chip' in context and not is_etf:
             chip = context['chip']
             profit_ratio = chip.get('profit_ratio', 0)
             prompt += f"""
@@ -1062,6 +1283,13 @@ class GeminiAnalyzer:
 | 90%筹码集中度 | {chip.get('concentration_90', 0):.2%} | <15%为集中 |
 | 70%筹码集中度 | {chip.get('concentration_70', 0):.2%} | |
 | 筹码状态 | {chip.get('chip_status', '未知')} | |
+"""
+        elif is_etf:
+            prompt += """
+### 📌 ETF 特性说明
+- 此为 ETF 基金，不涉及个股筹码分布、基本面和股东变动
+- 分析重点：**趋势跟踪、量能变化、板块轮动、资金流向**
+- 请结合所属板块/行业的整体走势进行判断
 """
         
         # 添加趋势分析结果（基于交易理念的预判）

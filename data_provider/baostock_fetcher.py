@@ -66,7 +66,7 @@ class BaostockFetcher(BaseFetcher):
     """
     
     name = "BaostockFetcher"
-    priority = int(os.getenv("BAOSTOCK_PRIORITY", "3"))
+    priority = int(os.getenv("BAOSTOCK_PRIORITY", "4"))
     
     def __init__(self):
         """初始化 BaostockFetcher"""

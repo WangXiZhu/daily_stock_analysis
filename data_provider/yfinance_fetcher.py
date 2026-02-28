@@ -54,7 +54,7 @@ class YfinanceFetcher(BaseFetcher):
     """
     
     name = "YfinanceFetcher"
-    priority = int(os.getenv("YFINANCE_PRIORITY", "4"))
+    priority = int(os.getenv("YFINANCE_PRIORITY", "1"))  # AkshareFetcher(腾讯/新浪) 之后
     
     def __init__(self):
         """初始化 YfinanceFetcher"""

@@ -169,7 +169,7 @@ class EfinanceFetcher(BaseFetcher):
     """
     
     name = "EfinanceFetcher"
-    priority = int(os.getenv("EFINANCE_PRIORITY", "0"))  # 最高优先级，排在 AkshareFetcher 之前
+    priority = int(os.getenv("EFINANCE_PRIORITY", "2"))  # AkshareFetcher(腾讯/新浪) 优先
     
     def __init__(self, sleep_min: float = 1.5, sleep_max: float = 3.0):
         """
