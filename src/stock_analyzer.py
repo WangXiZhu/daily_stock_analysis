@@ -81,6 +81,7 @@ class RSIStatus(Enum):
 class TrendAnalysisResult:
     """趋势分析结果"""
     code: str
+    is_etf: bool = False
     
     # 趋势判断
     trend_status: TrendStatus = TrendStatus.CONSOLIDATION
@@ -133,6 +134,7 @@ class TrendAnalysisResult:
     def to_dict(self) -> Dict[str, Any]:
         return {
             'code': self.code,
+            'is_etf': self.is_etf,
             'trend_status': self.trend_status.value,
             'ma_alignment': self.ma_alignment,
             'trend_strength': self.trend_strength,
@@ -201,18 +203,19 @@ class StockTrendAnalyzer:
         """初始化分析器"""
         pass
     
-    def analyze(self, df: pd.DataFrame, code: str) -> TrendAnalysisResult:
+    def analyze(self, df: pd.DataFrame, code: str, is_etf: bool = False) -> TrendAnalysisResult:
         """
         分析股票趋势
         
         Args:
             df: 包含 OHLCV 数据的 DataFrame
             code: 股票代码
+            is_etf: 是否为 ETF，走专属 ETF 决策
             
         Returns:
             TrendAnalysisResult 分析结果
         """
-        result = TrendAnalysisResult(code=code)
+        result = TrendAnalysisResult(code=code, is_etf=is_etf)
         
         if df is None or df.empty or len(df) < 20:
             logger.warning(f"{code} 数据不足，无法进行趋势分析")
@@ -582,7 +585,13 @@ class StockTrendAnalyzer:
     def _generate_signal(self, result: TrendAnalysisResult) -> None:
         """
         生成买入信号
+        """
+        # 如果是 ETF，走专门的 ETF 评分逻辑
+        if result.is_etf:
+            self._generate_signal_etf(result)
+            return
 
+        """
         综合评分系统：
         - 趋势（30分）：多头排列得分高
         - 乖离率（20分）：接近 MA5 得分高
@@ -716,7 +725,135 @@ class StockTrendAnalyzer:
             result.buy_signal = BuySignal.STRONG_SELL
         else:
             result.buy_signal = BuySignal.SELL
-    
+
+    def _generate_signal_etf(self, result: TrendAnalysisResult) -> None:
+        """
+        生成 ETF 特有的买入信号
+
+        ETF 综合评分系统：
+        - 趋势（40分）：趋势跟踪对 ETF 最重要（多头排列得分高）
+        - 乖离率（20分）：接近 MA5 得分高，由于 ETF 波动小，扣分条件更严格（>3%不买）
+        - 支撑（15分）：获得均线支撑得分高
+        - MACD（15分）：金叉和多头得分高
+        - RSI（10分）：超卖和强势得分高
+        """
+        score = 0
+        reasons = []
+        risks = []
+
+        # === 趋势评分（40分）===
+        trend_scores = {
+            TrendStatus.STRONG_BULL: 40,
+            TrendStatus.BULL: 35,
+            TrendStatus.WEAK_BULL: 25,
+            TrendStatus.CONSOLIDATION: 15,
+            TrendStatus.WEAK_BEAR: 10,
+            TrendStatus.BEAR: 5,
+            TrendStatus.STRONG_BEAR: 0,
+        }
+        trend_score = trend_scores.get(result.trend_status, 15)
+        score += trend_score
+
+        if result.trend_status in [TrendStatus.STRONG_BULL, TrendStatus.BULL]:
+            reasons.append(f"✅ 【ETF趋势】{result.trend_status.value}，顺势做多")
+        elif result.trend_status in [TrendStatus.BEAR, TrendStatus.STRONG_BEAR]:
+            risks.append(f"⚠️ 【ETF趋势】{result.trend_status.value}，空头规避")
+
+        # === 乖离率评分（20分）===
+        bias = result.bias_ma5
+        # ETF 阈值更严格，因为波动一般小于个股
+        ETF_BIAS_THRESHOLD = 3.0
+        
+        if bias < 0:
+            if bias > -2:
+                score += 20
+                reasons.append(f"✅ 【ETF价格】价格贴近MA5({bias:.1f}%)，回踩买点")
+            elif bias > -4:
+                score += 15
+                reasons.append(f"✅ 【ETF价格】价格回踩MA5({bias:.1f}%)，观察支撑")
+            else:
+                score += 5
+                risks.append(f"⚠️ 【ETF价格】严重破位({bias:.1f}%)，建议观望")
+        elif bias < 1.5:
+            score += 18
+            reasons.append(f"✅ 【ETF价格】价格贴近MA5({bias:.1f}%)，介入时机佳")
+        elif bias < ETF_BIAS_THRESHOLD:
+            score += 12
+            reasons.append(f"⚡ 【ETF价格】略高于MA5({bias:.1f}%)，仍可分批配置")
+        else:
+            score += 0
+            risks.append(f"❌ 【ETF价格】乖离率过高({bias:.1f}%>{ETF_BIAS_THRESHOLD}%)，严防追高回调")
+
+        # === 支撑评分（15分）===
+        support_score = 0
+        if result.support_ma5:
+            support_score += 8
+            reasons.append("✅ 【ETF支撑】MA5支撑有效")
+        if result.support_ma10:
+            support_score += 7
+            reasons.append("✅ 【ETF支撑】MA10支撑有效")
+        score += support_score
+
+        # === MACD 评分（15分）===
+        macd_scores = {
+            MACDStatus.GOLDEN_CROSS_ZERO: 15,
+            MACDStatus.GOLDEN_CROSS: 12,
+            MACDStatus.CROSSING_UP: 10,
+            MACDStatus.BULLISH: 8,
+            MACDStatus.BEARISH: 2,
+            MACDStatus.CROSSING_DOWN: 0,
+            MACDStatus.DEATH_CROSS: 0,
+        }
+        macd_score = macd_scores.get(result.macd_status, 5)
+        score += macd_score
+
+        if result.macd_status in [MACDStatus.GOLDEN_CROSS_ZERO, MACDStatus.GOLDEN_CROSS]:
+            reasons.append(f"✅ 【ETF动能】{result.macd_signal}")
+        elif result.macd_status in [MACDStatus.DEATH_CROSS, MACDStatus.CROSSING_DOWN]:
+            risks.append(f"⚠️ 【ETF动能】{result.macd_signal}")
+
+        # === RSI 评分（10分）===
+        rsi_scores = {
+            RSIStatus.OVERSOLD: 10,
+            RSIStatus.STRONG_BUY: 8,
+            RSIStatus.NEUTRAL: 5,
+            RSIStatus.WEAK: 3,
+            RSIStatus.OVERBOUGHT: 0,
+        }
+        rsi_score = rsi_scores.get(result.rsi_status, 5)
+        score += rsi_score
+
+        if result.rsi_status in [RSIStatus.OVERSOLD, RSIStatus.STRONG_BUY]:
+            reasons.append(f"✅ 【ETF摆动】{result.rsi_signal}")
+        elif result.rsi_status == RSIStatus.OVERBOUGHT:
+            risks.append(f"⚠️ 【ETF摆动】{result.rsi_signal}")
+
+        # === 量能附加逻辑 ===
+        if result.volume_status == VolumeStatus.SHRINK_VOLUME_DOWN:
+            reasons.append("✅ 【ETF量能】缩量回调")
+        elif result.volume_status == VolumeStatus.HEAVY_VOLUME_DOWN:
+            risks.append("⚠️ 【ETF量能】放量抛压，注意风险")
+            score = max(0, score - 5)
+
+        # === 综合判断 ===
+        result.signal_score = score
+        result.signal_reasons = reasons
+        result.risk_factors = risks
+
+        # 生成买入信号
+        if score >= 75 and result.trend_status in [TrendStatus.STRONG_BULL, TrendStatus.BULL]:
+            result.buy_signal = BuySignal.STRONG_BUY
+        elif score >= 60 and result.trend_status in [TrendStatus.STRONG_BULL, TrendStatus.BULL, TrendStatus.WEAK_BULL]:
+            result.buy_signal = BuySignal.BUY
+        elif score >= 45:
+            result.buy_signal = BuySignal.HOLD
+        elif score >= 30:
+            result.buy_signal = BuySignal.WAIT
+        elif result.trend_status in [TrendStatus.BEAR, TrendStatus.STRONG_BEAR]:
+            result.buy_signal = BuySignal.STRONG_SELL
+        else:
+            result.buy_signal = BuySignal.SELL
+            
     def format_analysis(self, result: TrendAnalysisResult) -> str:
         """
         格式化分析结果为文本
@@ -775,19 +912,20 @@ class StockTrendAnalyzer:
         return "\n".join(lines)
 
 
-def analyze_stock(df: pd.DataFrame, code: str) -> TrendAnalysisResult:
+def analyze_stock(df: pd.DataFrame, code: str, is_etf: bool = False) -> TrendAnalysisResult:
     """
     便捷函数：分析单只股票
     
     Args:
         df: 包含 OHLCV 数据的 DataFrame
         code: 股票代码
+        is_etf: 是否为 ETF
         
     Returns:
         TrendAnalysisResult 分析结果
     """
     analyzer = StockTrendAnalyzer()
-    return analyzer.analyze(df, code)
+    return analyzer.analyze(df, code, is_etf=is_etf)
 
 
 if __name__ == "__main__":
